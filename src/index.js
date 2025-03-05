@@ -1,0 +1,167 @@
+import { readFile } from 'fs/promises';
+import yargs from 'yargs';
+import { GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+
+const DEST_BUCKET = 'da-content-dev';
+const MaxKeys = 10;
+
+async function createOrg(config, org) {
+  let resp = await fetch(`${config.source.daAdminUrl}/list`);
+  if (!resp.ok) throw new Error('Could not fetch org list.');
+
+  let orgs = await resp.json();
+  const created = orgs.find((o) => o.name === org)?.created;
+  if (!created) throw new Error('Could not new org in source list.');
+  const body = JSON.stringify({
+    total: 1,
+    limit: 1,
+    offset: 0,
+    data: [{
+      created,
+    }],
+  });
+
+  console.log(`Creating temporary ${org} file, to update DA_AUTH.`);
+  // Have to use the Admin API.
+  resp = await fetch(`${config.dest.daAdminUrl}/source/${org}/migration`, { method: 'POST', body });
+  if (!resp.ok) throw new Error('Could not create migration props file.');
+  resp = await fetch(`${config.dest.daAdminUrl}/list`);
+  if (!resp.ok) throw new Error('Could not fetch org list.');
+  orgs = await resp.json();
+  if (!orgs.some((o) => o.name === org)) throw new Error('Could not find new org in list.');
+  resp = await fetch(`${config.dest.daAdminUrl}/source/${org}/migration`, { method: 'DELETE' });
+  if (!resp.ok) throw new Error('Could not delete org migration props file.');
+}
+
+async function migrateOrgConfig(config, org) {
+  const getOpts = {};
+  if (config.bearer) getOpts.headers = { Authorization: `Bearer ${config.bearer}` };
+
+  const getResp = await fetch(`${config.source.daAdminUrl}/config/${org}`, getOpts);
+  if (getResp.status === 404) {
+    console.log('No config to migrate.');
+    return;
+  }
+  if (!getResp.ok) {
+    throw new Error('Could not fetch source config.', getResp.status);
+  }
+
+  const data = await getResp.text();
+  const body = new FormData();
+  body.append('config', data);
+
+  const postOpts = { method: 'POST', body };
+  if (config.bearer) postOpts.headers = { Authorization: `Bearer ${config.bearer}` };
+
+  const postResp = await fetch(`${config.dest.daAdminUrl}/config/${org}`, postOpts);
+  if (!postResp.ok) throw new Error('Could not create org config.');
+}
+
+async function migrateSiteConfig(config, org) {
+  const getOpts = {};
+  if (config.bearer) getOpts.headers = { Authorization: `Bearer ${config.bearer}` };
+  let getResp = await fetch(`${config.source.daAdminUrl}/list/${org}`, getOpts);
+  if (!getResp.ok) throw new Error('Could not create list Org??.');
+
+  const data = await getResp.json();
+  const sites = data.filter((entry) => !entry.ext);
+
+  for (const { name: site } of sites) {
+    console.log('Migrating site config', site);
+    getResp = await fetch(`${config.source.daAdminUrl}/config/${org}/${site}`, getOpts);
+    if (getResp.status === 404) {
+      console.log(`No config for ${site} to migrate.`);
+      return;
+    }
+    if (!getResp.ok) {
+      throw new Error('Could not fetch config for site', site, getResp.status);
+    }
+
+    const data = await resp.text();
+    const body = new FormData();
+    body.append('config', data);
+
+    const postOpts = { method: 'POST', body };
+    if (config.bearer) postOpts.headers = { Authorization: `Bearer ${config.bearer}` };
+
+    const postResp = await fetch(`${config.dest.daAdminUrl}/config/${org}/${site}`, postOpts);
+    if (!postResp.ok) throw new Error('Could not create config for site', site, postResp.status);
+  }
+}
+
+async function listSourceContent(client, org, ContinuationToken) {
+  const cmd = new ListObjectsV2Command({
+    Bucket: `${org}-content`,
+    MaxKeys,
+    ContinuationToken,
+  });
+
+  const resp = await client.send(cmd);
+  if (resp.$metadata.httpStatusCode !== 200) throw new Error('Unable to list source content.', resp.$metadata.httpStatusCode);
+  const { Contents = [], NextContinuationToken } = resp;
+  const files = Contents.map((c) => c.Key);
+  return { files, continuation: NextContinuationToken };
+}
+
+async function copyFile(srcClient, destClient, org, Key) {
+  console.log('Copying', Key);
+  const cmd = new GetObjectCommand({
+    Bucket: `${org}-content`,
+    Key,
+  });
+
+  const getResp = await srcClient.send(cmd);
+  if (getResp.$metadata.httpStatusCode !== 200) throw new Error(`Unable to get source ${Key}.`, resp.$metadata.httpStatusCode);
+  const { Body, ContentType, ContentLength, Metadata } = getResp;
+
+  const input = {
+    Bucket: DEST_BUCKET,
+    Key: `${org}/${Key}`,
+    Body,
+    ContentType,
+    ContentLength,
+    Metadata,
+  };
+
+  const putCmd = new PutObjectCommand(input);
+  const putResp = await destClient.send(putCmd);
+  if (putResp.$metadata.httpStatusCode !== 200) throw new Error(`Unable to put destination ${org}/${Key}.`, resp.$metadata.httpStatusCode);
+}
+
+async function migrateContent(config, org) {
+  const srcClient = new S3Client(config.source);
+  const destClient = new S3Client(config.dest);
+  let token = undefined;
+  do {
+    let { files, continuation } = await listSourceContent(srcClient, org, token);
+    token = continuation;
+
+    const promises = [];
+    for (const file of files) {
+      promises.push(copyFile(srcClient, destClient, org, file));
+    }
+    await Promise.all(promises);
+  } while (token);
+}
+
+
+const config = await readFile('.dev.vars', { encoding: 'utf8' }).then((data) => JSON.parse(data));
+
+const argv = yargs(process.argv.splice(2))
+  .check((argv) => {
+    const orgs = argv._;
+    if (orgs.length !== 1) {
+      throw new Error('An org must be specified')
+    }
+    return true;
+  })
+  .parse()
+
+const org = argv._[0];
+
+await createOrg(config, org);
+await migrateOrgConfig(config, org);
+await migrateSiteConfig(config, org);
+await migrateContent(config, org);
+
+console.log('Migration complete.');

@@ -1,9 +1,10 @@
-import { readFile } from 'fs/promises';
+import { stdout } from 'node:process';
+import { readFile, writeFile } from 'fs/promises';
 import yargs from 'yargs';
 import { GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 
 const DEST_BUCKET = 'da-content-dev';
-const MaxKeys = 10;
+const MaxKeys = 100;
 
 async function createOrg(config, org) {
   let resp = await fetch(`${config.source.daAdminUrl}/list`);
@@ -43,6 +44,10 @@ async function migrateOrgConfig(config, org) {
     return;
   }
   if (!getResp.ok) {
+    // if (getResp.status === 403) {
+    //   console.log('Skipping config as not authorized.');
+    //   return;
+    // }
     throw new Error('Could not fetch source config.', getResp.status);
   }
 
@@ -61,7 +66,13 @@ async function migrateSiteConfig(config, org) {
   const getOpts = {};
   if (config.bearer) getOpts.headers = { Authorization: `Bearer ${config.bearer}` };
   let getResp = await fetch(`${config.source.daAdminUrl}/list/${org}`, getOpts);
-  if (!getResp.ok) throw new Error('Could not create list Org??.');
+  if (!getResp.ok) {
+    // if (getResp.status === 401 || getResp.status === 403) {
+    //   console.log(`Skipping site configs for ${org} as not authorized.`);
+    //   return;
+    // }
+    throw new Error('Could not list Org sites.', getResp.status);
+  }
 
   const data = await getResp.json();
   const sites = data.filter((entry) => !entry.ext);
@@ -69,11 +80,15 @@ async function migrateSiteConfig(config, org) {
   for (const { name: site } of sites) {
     console.log('Migrating site config', site);
     getResp = await fetch(`${config.source.daAdminUrl}/config/${org}/${site}`, getOpts);
-    if (getResp.status === 404) {
-      console.log(`No config for ${site} to migrate.`);
-      return;
-    }
     if (!getResp.ok) {
+      if (getResp.status === 404) {
+        console.log(`No config for ${site} to migrate.`);
+        return;
+      }
+      // if (getResp.status === 401 || getResp.status === 403) {
+      //   console.log(`Skipping config for ${site} as not authorized.`);
+      //   return;
+      // }
       throw new Error('Could not fetch config for site', site, getResp.status);
     }
 
@@ -104,34 +119,52 @@ async function listSourceContent(client, org, ContinuationToken) {
 }
 
 async function copyFile(srcClient, destClient, org, Key) {
-  console.log('Copying', Key);
-  const cmd = new GetObjectCommand({
-    Bucket: `${org}-content`,
-    Key,
+
+  return new Promise(async (resolve, reject) => {
+    try {
+      const cmd = new GetObjectCommand({
+        Bucket: `${org}-content`,
+        Key,
+      });
+
+      const getResp = await srcClient.send(cmd);
+      if (getResp.$metadata.httpStatusCode !== 200) {
+        reject(Key);
+      }
+      const { Body, ContentType, ContentLength, Metadata } = getResp;
+      const bodyStr = await Body.transformToString();
+      const input = {
+        Bucket: DEST_BUCKET,
+        Key: `${org}/${Key}`,
+        Body: bodyStr,
+        ContentType,
+        ContentLength,
+        Metadata,
+      };
+
+      const putCmd = new PutObjectCommand(input);
+      const putResp = await destClient.send(putCmd);
+      if (putResp.$metadata.httpStatusCode !== 200) {
+        reject(Key);
+      }
+
+      resolve(Key);
+    } catch (e) {
+      reject(Key);
+    }
   });
-
-  const getResp = await srcClient.send(cmd);
-  if (getResp.$metadata.httpStatusCode !== 200) throw new Error(`Unable to get source ${Key}.`, resp.$metadata.httpStatusCode);
-  const { Body, ContentType, ContentLength, Metadata } = getResp;
-
-  const input = {
-    Bucket: DEST_BUCKET,
-    Key: `${org}/${Key}`,
-    Body,
-    ContentType,
-    ContentLength,
-    Metadata,
-  };
-
-  const putCmd = new PutObjectCommand(input);
-  const putResp = await destClient.send(putCmd);
-  if (putResp.$metadata.httpStatusCode !== 200) throw new Error(`Unable to put destination ${org}/${Key}.`, resp.$metadata.httpStatusCode);
 }
 
 async function migrateContent(config, org) {
+  const status = {
+    org,
+    success: [],
+    failed: [],
+  }
   const srcClient = new S3Client(config.source);
   const destClient = new S3Client(config.dest);
   let token = undefined;
+  let i = 0;
   do {
     let { files, continuation } = await listSourceContent(srcClient, org, token);
     token = continuation;
@@ -140,8 +173,16 @@ async function migrateContent(config, org) {
     for (const file of files) {
       promises.push(copyFile(srcClient, destClient, org, file));
     }
-    await Promise.all(promises);
+    await Promise.allSettled(promises).then((results) => {
+      results.forEach((result) => result.value ? status.success.push(result.value) : status.failed.push(result.reason));
+    });
+
+    stdout.clearLine(0);
+    stdout.cursorTo(0);
+    stdout.write(`Copied ${i * MaxKeys + files.length} files.`);
+    i++;
   } while (token);
+  return status;
 }
 
 
@@ -162,6 +203,8 @@ const org = argv._[0];
 await createOrg(config, org);
 await migrateOrgConfig(config, org);
 await migrateSiteConfig(config, org);
-await migrateContent(config, org);
+const results =  await migrateContent(config, org);
+
+await writeFile(`migrate-${org}.results.json`, JSON.stringify(results, null, 2));
 
 console.log('Migration complete.');

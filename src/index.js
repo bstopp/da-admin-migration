@@ -206,5 +206,6 @@ await migrateSiteConfig(config, org);
 const results =  await migrateContent(config, org);
 
 await writeFile(`migrate-${org}.results.json`, JSON.stringify(results, null, 2));
-
+console.log('Successes:', results.success.length);
+console.log('Failures:', results.failed.length);
 console.log('Migration complete.');

@@ -1,9 +1,9 @@
-import { stdout } from 'node:process';
+import process, { stdout } from 'node:process';
 import { readFile, writeFile } from 'fs/promises';
 import yargs from 'yargs';
 import { GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 
-const DEST_BUCKET = 'da-content-dev';
+const DEST_BUCKET = 'da-content';
 const MaxKeys = 100;
 
 async function createOrg(config, org) {
@@ -12,7 +12,7 @@ async function createOrg(config, org) {
 
   let orgs = await resp.json();
   const created = orgs.find((o) => o.name === org)?.created;
-  if (!created) throw new Error('Could not new org in source list.');
+  if (!created) throw new Error('Could not find org in source list.');
   const body = JSON.stringify({
     total: 1,
     limit: 1,
@@ -44,10 +44,10 @@ async function migrateOrgConfig(config, org) {
     return;
   }
   if (!getResp.ok) {
-    // if (getResp.status === 403) {
-    //   console.log('Skipping config as not authorized.');
-    //   return;
-    // }
+    if (getResp.status === 403) {
+      console.log('Skipping config as not authorized.');
+      return;
+    }
     throw new Error('Could not fetch source config.', getResp.status);
   }
 
@@ -67,10 +67,10 @@ async function migrateSiteConfig(config, org) {
   if (config.bearer) getOpts.headers = { Authorization: `Bearer ${config.bearer}` };
   let getResp = await fetch(`${config.source.daAdminUrl}/list/${org}`, getOpts);
   if (!getResp.ok) {
-    // if (getResp.status === 401 || getResp.status === 403) {
-    //   console.log(`Skipping site configs for ${org} as not authorized.`);
-    //   return;
-    // }
+    if (getResp.status === 401 || getResp.status === 403) {
+      console.log(`Skipping site configs for ${org} as not authorized.`);
+      return;
+    }
     throw new Error('Could not list Org sites.', getResp.status);
   }
 
@@ -85,10 +85,10 @@ async function migrateSiteConfig(config, org) {
         console.log(`No config for ${site} to migrate.`);
         return;
       }
-      // if (getResp.status === 401 || getResp.status === 403) {
-      //   console.log(`Skipping config for ${site} as not authorized.`);
-      //   return;
-      // }
+      if (getResp.status === 401 || getResp.status === 403) {
+        console.log(`Skipping config for ${site} as not authorized.`);
+        return;
+      }
       throw new Error('Could not fetch config for site', site, getResp.status);
     }
 
@@ -132,11 +132,10 @@ async function copyFile(srcClient, destClient, org, Key) {
         reject(Key);
       }
       const { Body, ContentType, ContentLength, Metadata } = getResp;
-      const bodyStr = await Body.transformToString();
       const input = {
         Bucket: DEST_BUCKET,
         Key: `${org}/${Key}`,
-        Body: bodyStr,
+        Body,
         ContentType,
         ContentLength,
         Metadata,
@@ -182,6 +181,7 @@ async function migrateContent(config, org) {
     stdout.write(`Copied ${i * MaxKeys + files.length} files.`);
     i++;
   } while (token);
+  stdout.write('\n');
   return status;
 }
 

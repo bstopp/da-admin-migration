@@ -235,7 +235,7 @@ if (!retry) {
   await createOrg(config, org);
   await migrateOrgConfig(config, org);
   await migrateSiteConfig(config, org);
-  // results = await migrateContent(config, org);
+  results = await migrateContent(config, org);
   await writeFile(`migrate-${org}.results.json`, JSON.stringify(results, null, 2));
   console.log('Successes:', results.success.length);
   console.log('Failures:', results.failed.length);

@@ -185,13 +185,41 @@ async function migrateContent(config, org) {
   return status;
 }
 
+async function retryMigration(config, org) {
+  const status = {
+    org,
+    success: [],
+    failed: [],
+  }
+  const srcClient = new S3Client(config.source);
+  const destClient = new S3Client(config.dest);
+  const files = await readFile(`migrate-${org}.results.json`, { encoding: 'utf8' }).then((data) => JSON.parse(data).failed);
+  let i = 0;
+
+  do {
+    const promises = [];
+    while (i < MaxKeys && i < files.length) {
+      promises.push(copyFile(srcClient, destClient, org, files[i]));
+      i++;
+    }
+    await Promise.allSettled(promises).then((results) => {
+      results.forEach((result) => result.value ? status.success.push(result.value) : status.failed.push(result.reason));
+    });
+
+    stdout.clearLine(0);
+    stdout.cursorTo(0);
+    stdout.write(`Copied ${i} files.`);
+  } while (i < files.length);
+  stdout.write('\n');
+  return status;
+}
 
 const config = await readFile('.dev.vars', { encoding: 'utf8' }).then((data) => JSON.parse(data));
 
 const argv = yargs(process.argv.splice(2))
   .check((argv) => {
-    const orgs = argv._;
-    if (orgs.length !== 1) {
+    const args = argv._;
+    if (args.length <= 1) {
       throw new Error('An org must be specified')
     }
     return true;
@@ -199,13 +227,26 @@ const argv = yargs(process.argv.splice(2))
   .parse()
 
 const org = argv._[0];
+const retry = argv._[1] === 'retry';
 
-await createOrg(config, org);
-await migrateOrgConfig(config, org);
-await migrateSiteConfig(config, org);
-const results =  await migrateContent(config, org);
+let results;
+if (!retry) {
+  console.log('Migrating', org)
+  await createOrg(config, org);
+  await migrateOrgConfig(config, org);
+  await migrateSiteConfig(config, org);
+  // results = await migrateContent(config, org);
+  await writeFile(`migrate-${org}.results.json`, JSON.stringify(results, null, 2));
+  console.log('Successes:', results.success.length);
+  console.log('Failures:', results.failed.length);
+  console.log('Migration complete.');
+} else {
+  console.log('Retrying failures in migration of', org);
+  results = await retryMigration(config, org);
+  await writeFile(`retry-${org}.results.json`, JSON.stringify(results, null, 2));
+  console.log('Successes:', results.success.length);
+  console.log('Failures:', results.failed.length);
+  console.log('Retry complete.');
 
-await writeFile(`migrate-${org}.results.json`, JSON.stringify(results, null, 2));
-console.log('Successes:', results.success.length);
-console.log('Failures:', results.failed.length);
-console.log('Migration complete.');
+}
+

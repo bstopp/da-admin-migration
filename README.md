@@ -34,3 +34,5 @@ This is intended to migrate an org from one DA Admin to another.
 
 
 3. Run `npm run migrate <org>`
+
+4. To retry failed copies from a migration, run `npm run migrate <org> retry`
